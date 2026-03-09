@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Einthusan IMDB Ratings
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.2
 // @description  Show IMDB ratings next to Wiki/Trailer on einthusan.tv movie pages
 // @author       Robins Tharakan
 // @license      Apache-2.0
@@ -91,6 +91,27 @@
             return;
         }
 
+        const cacheKey = `${movieName}_${year || ''}`;
+        let cache = {};
+        try {
+            cache = JSON.parse(GM_getValue('omdb_cache', '{}'));
+        } catch (e) {
+            cache = {};
+        }
+
+        const cached = cache[cacheKey];
+        const ONE_DAY = 1 * 24 * 60 * 60 * 1000;
+        const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
+        
+        if (cached) {
+            const age = Date.now() - cached.ts;
+            const ttl = (cached.rating === 'Fail') ? ONE_DAY : SEVEN_DAYS;
+            if (age < ttl) {
+                callback(cached.rating, cached.id, cached.reason);
+                return;
+            }
+        }
+
         const base = `https://www.omdbapi.com/?apikey=${OMDB_API_KEY}`;
         const enc  = encodeURIComponent(movieName);
 
@@ -109,6 +130,14 @@
         function omdb(url) {
             return fetchText(url).then(JSON.parse);
         }
+
+        // Intercept callback to cache the result
+        const originalCallback = callback;
+        callback = (rating, id, reason) => {
+            cache[cacheKey] = { rating, id, reason, ts: Date.now() };
+            GM_setValue('omdb_cache', JSON.stringify(cache));
+            originalCallback(rating, id, reason);
+        };
 
         // Fallback chain:
         //  1. Exact title + year
