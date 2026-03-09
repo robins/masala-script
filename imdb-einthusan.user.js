@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Einthusan IMDB Ratings
 // @namespace    http://tampermonkey.net/
-// @version      0.5
+// @version      0.6
 // @description  Show IMDB ratings next to Wiki/Trailer on einthusan.tv movie pages
 // @author       Robins Tharakan
 // @license      Apache-2.0
@@ -9,6 +9,8 @@
 // @updateURL    https://raw.githubusercontent.com/robins/masala-script/main/imdb-einthusan.user.js
 // @match        https://einthusan.tv/movie/results/*
 // @match        https://einthusan.tv/movie/browse/*
+// @match        https://einthusan.tv/movie/watch/*
+// @match        https://einthusan.tv/premium/movie/watch/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -138,9 +140,17 @@
     }
 
     // ──────────────────────────────────────────────
-    // Main: inject ratings into every movie card
+    // Detect page type
     // ──────────────────────────────────────────────
-    function addIMDBRatings() {
+    function isMovieWatchPage() {
+        return /\/movie\/watch\//.test(location.pathname)
+            || /\/premium\/movie\/watch\//.test(location.pathname);
+    }
+
+    // ──────────────────────────────────────────────
+    // Listing pages: inject ratings into every card
+    // ──────────────────────────────────────────────
+    function addIMDBRatingsToListings() {
         // Each movie card is an <li> containing div.block3 > div.extras
         const extrasContainers = document.querySelectorAll('div.block3 div.extras');
 
@@ -183,6 +193,53 @@
                 extras.appendChild(badge);
             });
         });
+    }
+
+    // ──────────────────────────────────────────────
+    // Movie watch page: inject rating next to Wiki / Trailer
+    // ──────────────────────────────────────────────
+    function addIMDBRatingToMoviePage() {
+        const extras = document.querySelector('div.extras');
+        if (!extras || extras.dataset.imdbAdded) return;
+        extras.dataset.imdbAdded = '1';
+
+        // Movie title — h3 inside the movie info section
+        const titleElem = document.querySelector('h3');
+        const movieName = titleElem ? titleElem.textContent.trim() : null;
+        if (!movieName) return;
+
+        // Year from the <p> containing "2022 Tamil HD..." etc.
+        let year = null;
+        const infoParagraphs = document.querySelectorAll('p');
+        for (const p of infoParagraphs) {
+            const m = p.textContent.match(/\b(19|20)\d{2}\b/);
+            if (m) { year = m[0]; break; }
+        }
+
+        // Try to extract IMDb ID from existing links in extras
+        let existingImdbID = null;
+        const imdbLink = extras.querySelector('a[href*="imdb.com"]');
+        if (imdbLink) {
+            const idMatch = imdbLink.href.match(/tt\d+/);
+            if (idMatch) existingImdbID = idMatch[0];
+        }
+
+        fetchRating(movieName, year, (rating, imdbID) => {
+            const finalID = existingImdbID || imdbID;
+            const badge = createBadge(rating, finalID);
+            extras.appendChild(badge);
+        });
+    }
+
+    // ──────────────────────────────────────────────
+    // Dispatcher: pick the right handler for the page
+    // ──────────────────────────────────────────────
+    function addIMDBRatings() {
+        if (isMovieWatchPage()) {
+            addIMDBRatingToMoviePage();
+        } else {
+            addIMDBRatingsToListings();
+        }
     }
 
     // ──────────────────────────────────────────────
