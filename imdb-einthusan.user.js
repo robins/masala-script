@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Einthusan IMDB Ratings
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.4
 // @description  Show IMDB ratings next to Wiki/Trailer on einthusan.tv movie pages
 // @author       Robins Tharakan
 // @license      Apache-2.0
@@ -16,6 +16,7 @@
 // @grant        GM_setValue
 // @connect      omdbapi.com
 // @connect      wikipedia.org
+// @connect      imdb.com
 // ==/UserScript==
 
 (function () {
@@ -24,8 +25,6 @@
     // ──────────────────────────────────────────────
     // Configuration
     // ──────────────────────────────────────────────
-    const USE_STATIC_RATING = false;  // true = skip API, return static 9.9
-    const STATIC_RATING     = '9.9';
 
     // API key stored in Tampermonkey — prompted on first run
     let OMDB_API_KEY = GM_getValue('omdb_api_key', '');
@@ -78,20 +77,21 @@
     }
 
     // ──────────────────────────────────────────────
+    // IMDB scrape budget: only one direct IMDB HTML
+    // scrape per page load to avoid rate-limiting
+    // ──────────────────────────────────────────────
+    let imdbScrapeUsed = false;
+
+    // ──────────────────────────────────────────────
     // Fetch rating (stub or real API)
     // ──────────────────────────────────────────────
-    function fetchRating(movieName, year, wikiUrl, callback) {
-        if (USE_STATIC_RATING) {
-            callback(STATIC_RATING, null);
-            return;
-        }
-
+    function fetchRating(movieName, year, wikiUrl, directImdbId, callback) {
         if (!OMDB_API_KEY) {
             callback('Fail', null, 'No OMDB API key configured');
             return;
         }
 
-        const cacheKey = `${movieName}_${year || ''}`;
+        const cacheKey = `v2_${movieName}_${year || ''}_${directImdbId || ''}`;
         let cache = {};
         try {
             cache = JSON.parse(GM_getValue('omdb_cache', '{}'));
@@ -102,10 +102,11 @@
         const cached = cache[cacheKey];
         const ONE_DAY = 1 * 24 * 60 * 60 * 1000;
         const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
-        
+
         if (cached) {
             const age = Date.now() - cached.ts;
-            const ttl = (cached.rating === 'Fail') ? ONE_DAY : SEVEN_DAYS;
+            const isMissing = (cached.rating === 'Fail' || cached.rating === 'N/A');
+            const ttl = isMissing ? ONE_DAY : SEVEN_DAYS;
             if (age < ttl) {
                 callback(cached.rating, cached.id, cached.reason);
                 return;
@@ -113,14 +114,14 @@
         }
 
         const base = `https://www.omdbapi.com/?apikey=${OMDB_API_KEY}`;
-        const enc  = encodeURIComponent(movieName);
+        const enc = encodeURIComponent(movieName);
 
         // Helper: fetch raw text
         function fetchText(url) {
             return new Promise((resolve, reject) => {
                 GM_xmlhttpRequest({
                     method: 'GET', url,
-                    onload(r)  { resolve(r.responseText); },
+                    onload(r) { resolve(r.responseText); },
                     onerror(e) { reject(e); }
                 });
             });
@@ -139,18 +140,73 @@
             originalCallback(rating, id, reason);
         };
 
+        // Helper: scrape IMDB directly for rating
+        function scrapeImdbRating(imdbId) {
+            return new Promise((resolve) => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: `https://www.imdb.com/title/${imdbId}/`,
+                    onload(r) {
+                        try {
+                            const html = r.responseText;
+                            // Look for the JSON-LD script tag
+                            const match = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
+                            if (match) {
+                                const data = JSON.parse(match[1]);
+                                if (data && data.aggregateRating && data.aggregateRating.ratingValue) {
+                                    resolve(data.aggregateRating.ratingValue.toString());
+                                    return;
+                                }
+                            }
+                        } catch (e) {
+                            console.error('[IMDB Ratings] Error parsing IMDb HTML:', e);
+                        }
+                        resolve(null);
+                    },
+                    onerror() {
+                        resolve(null);
+                    }
+                });
+            });
+        }
+
         // Fallback chain:
+        //  0. Direct IMDb ID
         //  1. Exact title + year
         //  2. Wikipedia scraping (if wikiUrl) -> exact IMDb ID
         //  3. Exact title (no year)
         //  4. Search endpoint -> fetch by ID
         (async () => {
             try {
+                // Keep track of the best known IMDb ID for the badge link
+                let knownImdbId = directImdbId || null;
+
+                // 0) Direct IMDb ID
+                if (directImdbId) {
+                    const df = await omdb(`${base}&i=${directImdbId}`);
+                    if (df.Response === 'True') {
+                        if (df.imdbRating && df.imdbRating !== 'N/A') {
+                            return callback(df.imdbRating, df.imdbID);
+                        }
+                        // OMDB returned N/A — try scraping IMDb directly,
+                        // but only if we haven't already used the one-per-page
+                        // scrape budget (avoids hammering IMDB on listing pages)
+                        if (!imdbScrapeUsed) {
+                            imdbScrapeUsed = true;
+                            const scrapedRating = await scrapeImdbRating(directImdbId);
+                            if (scrapedRating) {
+                                return callback(scrapedRating, directImdbId);
+                            }
+                        }
+                        // Scrape skipped or failed — fall through to remaining steps
+                    }
+                }
+
                 // 1) Exact title + year
                 if (year) {
                     const d = await omdb(`${base}&t=${enc}&y=${year}`);
-                    if (d.Response === 'True' && d.imdbRating) {
-                        return callback(d.imdbRating, d.imdbID);
+                    if (d.Response === 'True' && d.imdbRating && d.imdbRating !== 'N/A') {
+                        return callback(d.imdbRating, knownImdbId || d.imdbID);
                     }
                 }
 
@@ -160,9 +216,10 @@
                         const html = await fetchText(wikiUrl);
                         const m = html.match(/imdb\.com\/title\/(tt\d+)/i);
                         if (m) {
+                            if (!knownImdbId) knownImdbId = m[1];
                             const df = await omdb(`${base}&i=${m[1]}`);
-                            if (df.Response === 'True' && df.imdbRating) {
-                                return callback(df.imdbRating, df.imdbID);
+                            if (df.Response === 'True' && df.imdbRating && df.imdbRating !== 'N/A') {
+                                return callback(df.imdbRating, knownImdbId || df.imdbID);
                             }
                         }
                     } catch (e) {
@@ -170,24 +227,24 @@
                     }
                 }
 
-                // 2) Exact title only
+                // 3) Exact title only
                 const d2 = await omdb(`${base}&t=${enc}`);
-                if (d2.Response === 'True' && d2.imdbRating) {
-                    return callback(d2.imdbRating, d2.imdbID);
+                if (d2.Response === 'True' && d2.imdbRating && d2.imdbRating !== 'N/A') {
+                    return callback(d2.imdbRating, knownImdbId || d2.imdbID);
                 }
 
-                // 3) Search endpoint
+                // 4) Search endpoint
                 const yearParam = year ? `&y=${year}` : '';
                 const ds = await omdb(`${base}&s=${enc}${yearParam}`);
                 if (ds.Response === 'True' && ds.Search?.length) {
                     const id = ds.Search[0].imdbID;
                     const df = await omdb(`${base}&i=${id}`);
-                    if (df.Response === 'True' && df.imdbRating) {
-                        return callback(df.imdbRating, df.imdbID);
+                    if (df.Response === 'True' && df.imdbRating && df.imdbRating !== 'N/A') {
+                        return callback(df.imdbRating, knownImdbId || df.imdbID);
                     }
                 }
 
-                callback('Fail', null, 'Movie not found after 3 attempts');
+                callback('N/A', knownImdbId, 'Rating not available on OMDB');
             } catch (e) {
                 callback('Fail', null, 'Error: ' + (e?.message || e?.statusText || 'request failed'));
             }
@@ -260,15 +317,22 @@
                 if (m) year = m[0];
             }
 
-            // Try to extract Wikipedia URL
+            // Try to extract Wikipedia URL or Direct IMDb ID
             let wikiUrl = null;
+            let directImdbId = null;
+
             const wikiLink = extras.querySelector('a[href*="wikipedia.org"]');
             if (wikiLink) {
                 wikiUrl = wikiLink.href;
             }
+            const imdbLink = extras.querySelector('a[href*="imdb.com/title/tt"]');
+            if (imdbLink) {
+                const m = imdbLink.href.match(/imdb\.com\/title\/(tt\d+)/i);
+                if (m) directImdbId = m[1];
+            }
 
             // Fetch (or stub) the rating and insert the badge
-            fetchRating(movieName, year, wikiUrl, (rating, imdbID, failReason) => {
+            fetchRating(movieName, year, wikiUrl, directImdbId, (rating, imdbID, failReason) => {
                 const badge = createBadge(rating, imdbID, failReason);
                 extras.appendChild(badge);
             });
@@ -296,14 +360,21 @@
             if (m) { year = m[0]; break; }
         }
 
-        // Try to extract Wikipedia URL
+        // Try to extract Wikipedia URL or Direct IMDb ID
         let wikiUrl = null;
+        let directImdbId = null;
+
         const wikiLink = extras.querySelector('a[href*="wikipedia.org"]');
         if (wikiLink) {
             wikiUrl = wikiLink.href;
         }
+        const imdbLink = extras.querySelector('a[href*="imdb.com/title/tt"]');
+        if (imdbLink) {
+            const m = imdbLink.href.match(/imdb\.com\/title\/(tt\d+)/i);
+            if (m) directImdbId = m[1];
+        }
 
-        fetchRating(movieName, year, wikiUrl, (rating, imdbID, failReason) => {
+        fetchRating(movieName, year, wikiUrl, directImdbId, (rating, imdbID, failReason) => {
             const badge = createBadge(rating, imdbID, failReason);
             extras.appendChild(badge);
         });
