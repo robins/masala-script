@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Einthusan IMDB Ratings
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Show IMDB ratings next to Wiki/Trailer on einthusan.tv movie pages
 // @author       Robins Tharakan
 // @license      Apache-2.0
@@ -17,6 +17,7 @@
 // @connect      omdbapi.com
 // @connect      wikipedia.org
 // @connect      imdb.com
+// @connect      graphql.imdb.com
 // ==/UserScript==
 
 (function () {
@@ -26,20 +27,89 @@
     // Configuration
     // ──────────────────────────────────────────────
 
-    // API key stored in Tampermonkey — prompted on first run
+    // API key stored in Tampermonkey — custom modal on first run
+    // (native prompt() gets hidden by Einthusan's own popups)
     let OMDB_API_KEY = GM_getValue('omdb_api_key', '');
-    if (!OMDB_API_KEY) {
-        OMDB_API_KEY = prompt(
-            'Einthusan IMDB Ratings\n\n'
-            + 'Enter your OMDB API key (free at https://www.omdbapi.com/apikey.aspx):'
-        );
-        if (OMDB_API_KEY) {
-            GM_setValue('omdb_api_key', OMDB_API_KEY.trim());
-            OMDB_API_KEY = OMDB_API_KEY.trim();
-        } else {
-            console.warn('[IMDB Ratings] No API key provided.');
-            OMDB_API_KEY = null; // will show Fail badges
+
+    function showApiKeyModal() {
+        return new Promise((resolve) => {
+            const overlay = document.createElement('div');
+            overlay.id = 'imdb-apikey-overlay';
+            overlay.style.cssText = `
+                position: fixed; inset: 0;
+                background: rgba(0,0,0,0.6);
+                z-index: 2147483647;
+                display: flex; align-items: center; justify-content: center;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            `;
+            overlay.innerHTML = `
+                <div style="background:#1a1a2e; color:#e0e0e0; border-radius:12px;
+                            padding:28px 32px; max-width:420px; width:90%;
+                            box-shadow:0 8px 32px rgba(0,0,0,0.5); text-align:center;">
+                    <div style="font-size:22px; font-weight:bold; margin-bottom:6px;">
+                        <span style="background:#f5c518; color:#000; padding:2px 8px;
+                                     border-radius:4px; font-size:14px; vertical-align:middle;
+                                     margin-right:6px;">IMDb</span>
+                        Einthusan Ratings
+                    </div>
+                    <p style="color:#aaa; font-size:13px; margin:12px 0 18px;">
+                        Enter your free OMDB API key to display IMDb ratings.<br>
+                        <a href="https://www.omdbapi.com/apikey.aspx" target="_blank"
+                           style="color:#f5c518;">Get a free key here &rarr;</a>
+                    </p>
+                    <input id="imdb-apikey-input" type="text" placeholder="e.g. a1b2c3d4"
+                           style="width:100%; box-sizing:border-box; padding:10px 14px;
+                                  border:1px solid #333; border-radius:6px; font-size:15px;
+                                  background:#16213e; color:#fff; outline:none;
+                                  margin-bottom:16px;" autocomplete="off" />
+                    <div style="display:flex; gap:10px; justify-content:center;">
+                        <button id="imdb-apikey-save" style="background:#f5c518; color:#000;
+                                border:none; padding:8px 24px; border-radius:6px; font-weight:bold;
+                                font-size:14px; cursor:pointer;">Save</button>
+                        <button id="imdb-apikey-skip" style="background:transparent; color:#888;
+                                border:1px solid #444; padding:8px 18px; border-radius:6px;
+                                font-size:14px; cursor:pointer;">Skip</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(overlay);
+
+            const input = overlay.querySelector('#imdb-apikey-input');
+            input.focus();
+
+            overlay.querySelector('#imdb-apikey-save').addEventListener('click', () => {
+                const key = input.value.trim();
+                overlay.remove();
+                resolve(key || null);
+            });
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    const key = input.value.trim();
+                    overlay.remove();
+                    resolve(key || null);
+                }
+            });
+            overlay.querySelector('#imdb-apikey-skip').addEventListener('click', () => {
+                overlay.remove();
+                resolve(null);
+            });
+        });
+    }
+
+    // Deferred bootstrap — waits for key modal if needed
+    async function initWithApiKey() {
+        if (!OMDB_API_KEY) {
+            const key = await showApiKeyModal();
+            if (key) {
+                GM_setValue('omdb_api_key', key);
+                OMDB_API_KEY = key;
+            } else {
+                console.warn('[IMDB Ratings] No API key provided.');
+                OMDB_API_KEY = null;
+            }
         }
+        // Now start injecting ratings
+        bootstrap();
     }
 
     // ──────────────────────────────────────────────
@@ -85,13 +155,14 @@
     // ──────────────────────────────────────────────
     // Fetch rating (stub or real API)
     // ──────────────────────────────────────────────
-    function fetchRating(movieName, year, wikiUrl, directImdbId, callback) {
+    function fetchRating(movieName, year, wikiUrl, directImdbId, callback, options) {
+        const allowScrape = options?.allowScrape || false;
         if (!OMDB_API_KEY) {
             callback('Fail', null, 'No OMDB API key configured');
             return;
         }
 
-        const cacheKey = `v2_${movieName}_${year || ''}_${directImdbId || ''}`;
+        const cacheKey = `v3_${movieName}_${year || ''}_${directImdbId || ''}`;
         let cache = {};
         try {
             cache = JSON.parse(GM_getValue('omdb_cache', '{}'));
@@ -102,8 +173,9 @@
         const cached = cache[cacheKey];
         const ONE_DAY = 1 * 24 * 60 * 60 * 1000;
         const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
+        const noCacheRead = new URLSearchParams(location.search).has('nocacheread');
 
-        if (cached) {
+        if (cached && !noCacheRead) {
             const age = Date.now() - cached.ts;
             const isMissing = (cached.rating === 'Fail' || cached.rating === 'N/A');
             const ttl = isMissing ? ONE_DAY : SEVEN_DAYS;
@@ -140,30 +212,49 @@
             originalCallback(rating, id, reason);
         };
 
-        // Helper: scrape IMDB directly for rating
+        // Helper: fetch IMDB rating via GraphQL API (bypasses OMDB)
+        // Uses IMDB's own GraphQL endpoint which returns JSON ratings
+        // without triggering the WAF challenge that blocks HTML scrapes
         function scrapeImdbRating(imdbId) {
             return new Promise((resolve) => {
+                const query = JSON.stringify({
+                    query: `query {
+                        title(id: "${imdbId}") {
+                            ratingsSummary {
+                                aggregateRating
+                                voteCount
+                            }
+                        }
+                    }`
+                });
                 GM_xmlhttpRequest({
-                    method: 'GET',
-                    url: `https://www.imdb.com/title/${imdbId}/`,
+                    method: 'POST',
+                    url: 'https://graphql.imdb.com/',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-imdb-client-name': 'imdb-web-next-localized'
+                    },
+                    data: query,
                     onload(r) {
+                        const body = r.responseText || r.response || '';
+                        console.log(`[IMDB Ratings] GraphQL ${imdbId}: status=${r.status}, body=${body.substring(0, 300)}`);
                         try {
-                            const html = r.responseText;
-                            // Look for the JSON-LD script tag
-                            const match = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
-                            if (match) {
-                                const data = JSON.parse(match[1]);
-                                if (data && data.aggregateRating && data.aggregateRating.ratingValue) {
-                                    resolve(data.aggregateRating.ratingValue.toString());
+                            if (r.status === 200) {
+                                const data = JSON.parse(body);
+                                const rating = data?.data?.title?.ratingsSummary?.aggregateRating;
+                                if (rating != null) {
+                                    console.log(`[IMDB Ratings] GraphQL rating for ${imdbId}:`, rating);
+                                    resolve(rating.toString());
                                     return;
                                 }
                             }
                         } catch (e) {
-                            console.error('[IMDB Ratings] Error parsing IMDb HTML:', e);
+                            console.error('[IMDB Ratings] Error parsing GraphQL response:', e);
                         }
                         resolve(null);
                     },
-                    onerror() {
+                    onerror(e) {
+                        console.error('[IMDB Ratings] GraphQL request failed:', e);
                         resolve(null);
                     }
                 });
@@ -188,11 +279,11 @@
                         if (df.imdbRating && df.imdbRating !== 'N/A') {
                             return callback(df.imdbRating, df.imdbID);
                         }
-                        // OMDB returned N/A — try scraping IMDb directly,
-                        // but only if we haven't already used the one-per-page
-                        // scrape budget (avoids hammering IMDB on listing pages)
-                        if (!imdbScrapeUsed) {
-                            imdbScrapeUsed = true;
+                        // OMDB returned N/A — try scraping IMDb directly.
+                        // On single-movie pages (allowScrape), always attempt.
+                        // On listing pages, respect the one-per-page budget.
+                        if (allowScrape || !imdbScrapeUsed) {
+                            if (!allowScrape) imdbScrapeUsed = true;
                             const scrapedRating = await scrapeImdbRating(directImdbId);
                             if (scrapedRating) {
                                 return callback(scrapedRating, directImdbId);
@@ -377,7 +468,7 @@
         fetchRating(movieName, year, wikiUrl, directImdbId, (rating, imdbID, failReason) => {
             const badge = createBadge(rating, imdbID, failReason);
             extras.appendChild(badge);
-        });
+        }, { allowScrape: true });
     }
 
     // ──────────────────────────────────────────────
@@ -432,16 +523,18 @@
     window.addEventListener('popstate', onUrlChange);
 
     // ──────────────────────────────────────────────
-    // Bootstrap
+    // Bootstrap — called by initWithApiKey() after
+    // the API key is available (or skipped)
     // ──────────────────────────────────────────────
-    if (document.readyState === 'loading') {
-        window.addEventListener('DOMContentLoaded', () => {
-            addIMDBRatings();
-            observeResults();
-        });
-    } else {
+    function bootstrap() {
         addIMDBRatings();
         observeResults();
+    }
+
+    if (document.readyState === 'loading') {
+        window.addEventListener('DOMContentLoaded', () => initWithApiKey());
+    } else {
+        initWithApiKey();
     }
 
 })();
