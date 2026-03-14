@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Einthusan IMDB Ratings
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  Show IMDB ratings next to Wiki/Trailer on einthusan.tv movie pages
 // @author       Robins Tharakan
 // @license      Apache-2.0
@@ -523,12 +523,87 @@
     window.addEventListener('popstate', onUrlChange);
 
     // ──────────────────────────────────────────────
+    // Keyboard Shortcut for Metadata Extraction
+    // ──────────────────────────────────────────────
+    function extractMetadata() {
+        if (!isMovieWatchPage()) {
+            alert("Not on a movie watch page.");
+            return;
+        }
+
+        // Variable 1: Download URL
+        let downloadUrl = "N/A";
+        
+        // Prefer actual download link elements on the page if available
+        const downloadLinkElem = document.querySelector('a[href*=".mp4"]');
+        if (downloadLinkElem) {
+            downloadUrl = downloadLinkElem.href;
+            
+            // Einthusan wraps the direct link in a redirect (e.g. /raw/?l=...)
+            // Extract the 'l' parameter and decode it.
+            try {
+                const urlObj = new URL(downloadUrl);
+                const lParam = urlObj.searchParams.get('l');
+                if (lParam) {
+                    downloadUrl = decodeURIComponent(lParam);
+                }
+            } catch (e) {
+                // If URL parsing fails, stick with what we have
+                console.warn("[IMDB Ratings] Could not parse download URL:", e);
+            }
+        } else {
+            // Fallback to video source if explicit link isn't found
+            const videoElement = document.querySelector('video');
+            if (videoElement) {
+                const src = videoElement.src || videoElement.currentSrc;
+                if (src) {
+                    // Strip the streaming extension and ensure no extra /d/ path exists
+                    downloadUrl = src.replace('.mp4.m3u8', '.mp4').replace('/d/etv/', '/etv/');
+                } else {
+                    downloadUrl = "Video source not found. Ensure video is loading.";
+                }
+            } else {
+                downloadUrl = "Video element not found. Please play the video first.";
+            }
+        }
+
+        // Variable 2: Slugified Movie Name
+        let movieName = "";
+        const titleElem = document.querySelector('section#UIMovieSummary a.title h3') || document.querySelector('h3');
+        if (titleElem) {
+            let rawName = titleElem.textContent.trim().toLowerCase();
+            // Replace non-ascii, special chars, and spaces with underscores
+            movieName = rawName.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+        } else {
+            movieName = "title_not_found";
+        }
+
+        const command = `aria2c -c "${downloadUrl}" -o "${movieName}.mp4"`;
+        navigator.clipboard.writeText(command).then(() => {
+            alert(`Copied to clipboard:\n\n${command}`);
+        }).catch(err => {
+            alert(`Failed to copy. You can manually copy this:\n\n${command}`);
+        });
+    }
+
+    function setupKeyboardShortcut() {
+        document.addEventListener('keydown', (e) => {
+            // Check for Ctrl + Shift + Alt + K
+            if (e.ctrlKey && e.shiftKey && e.altKey && e.code === 'KeyK') {
+                e.preventDefault();
+                extractMetadata();
+            }
+        });
+    }
+
+    // ──────────────────────────────────────────────
     // Bootstrap — called by initWithApiKey() after
     // the API key is available (or skipped)
     // ──────────────────────────────────────────────
     function bootstrap() {
         addIMDBRatings();
         observeResults();
+        setupKeyboardShortcut();
     }
 
     if (document.readyState === 'loading') {
